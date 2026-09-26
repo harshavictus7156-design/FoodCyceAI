@@ -29,6 +29,8 @@ def connect_partner(
             "recipient": ngo["name"],
             "status": "In Transit",
             "eta": f"{max(15, int(ngo.get('distance_km', 5) * 4))} min",
+            "location": item.get("location", "Main Kitchen Hub"),
+            "contact": item.get("contact", "Kitchen Staff"),
         }
     )
     save_current_data(inventory=inventory, tasks=tasks)
@@ -58,10 +60,38 @@ def claim_food_for_partner(
             "recipient": ngo["name"],
             "status": "Claimed",
             "eta": f"{max(10, int(ngo.get('distance_km', 4) * 3))} min",
+            "location": item.get("location", "Main Kitchen Hub"),
+            "contact": item.get("contact", "Kitchen Staff"),
         }
     )
     save_current_data(inventory=inventory, tasks=tasks)
     return True, f"{ngo['name']} claimed {item['item']} ({item.get('quantity_kg', 0)} kg) successfully."
+
+
+def claim_specific_food_item(
+    ngo: Dict[str, Any], item_id: str, inventory: List[Dict[str, Any]], tasks: List[Dict[str, Any]]
+) -> Tuple[bool, str]:
+    """Allows an NGO to claim a specific posted surplus batch."""
+    item = next((entry for entry in inventory if entry.get("id") == item_id), None)
+    if not item:
+        return False, "Selected surplus food batch was not found."
+    if item.get("status") in ["Dispatched", "Claimed", "Expired"]:
+        return False, f"{item['item']} is already {item.get('status')}."
+
+    item["status"] = "Claimed"
+    ngo["status"] = "Claimed"
+    tasks.append(
+        {
+            "task": f"{item['item']} pickup ({item.get('quantity_kg', 0)} kg)",
+            "recipient": ngo["name"],
+            "status": "Claimed",
+            "eta": f"{max(10, int(ngo.get('distance_km', 4) * 3))} min",
+            "location": item.get("location", "Kitchen Dispatch Station"),
+            "contact": item.get("contact", "Kitchen Duty Manager"),
+        }
+    )
+    save_current_data(inventory=inventory, tasks=tasks)
+    return True, f"{ngo['name']} successfully claimed {item['item']} ({item.get('quantity_kg', 0)} kg)!"
 
 
 def complete_or_reset_partner(

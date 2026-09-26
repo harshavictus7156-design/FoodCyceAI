@@ -1,6 +1,6 @@
 import os
 import time
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import pandas as pd
 import plotly.express as px
@@ -8,11 +8,12 @@ import streamlit as st
 from PIL import Image
 
 from config.settings import FOOD_CATEGORIES
-from src.services.dataService import load_initial_data, save_current_data
-from src.services.demandPredictor import forecast_summary
+from src.services.dataService import load_initial_data, save_current_data, normalize_inventory_item
+from src.services.demandPredictor import forecast_summary, predict_kitchen_waste
 from src.services.geminiService import analyze_food_quality
 from src.services.logisticsService import (
     claim_food_for_partner,
+    claim_specific_food_item,
     complete_or_reset_partner,
     connect_partner,
 )
@@ -466,10 +467,56 @@ section[data-testid="stFileUploaderDropzone"] button {
     color: #047857 !important;
     font-size: 0.84rem;
 }
+
+/* Production planning card */
+.terminal-card {
+    background: #FFFFFF;
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    padding: 1.2rem;
+    box-shadow: var(--shadow);
+    margin-bottom: 1rem;
+}
 </style>
 """
 
 st.markdown(CSS, unsafe_allow_html=True)
+
+
+def safe_inventory_dataframe(inventory_list: List[Dict[str, Any]]) -> pd.DataFrame:
+    """Safe DataFrame constructor that guarantees all required columns are present with sensible defaults to prevent KeyError."""
+    required_cols = [
+        "item",
+        "category",
+        "quantity_kg",
+        "expiry_hours",
+        "status",
+        "prepared_time",
+        "location",
+        "storage_condition",
+        "contact",
+    ]
+    if not inventory_list:
+        return pd.DataFrame(columns=required_cols)
+
+    df = pd.DataFrame(inventory_list)
+    defaults = {
+        "item": "Prepared Food Item",
+        "category": "Prepared Food",
+        "quantity_kg": 10.0,
+        "expiry_hours": 8,
+        "status": "Good",
+        "prepared_time": "Today, 11:30 AM",
+        "location": "Main Kitchen Central Station",
+        "storage_condition": "Chilled (4°C)",
+        "contact": "Kitchen Duty Manager (+91 98765 43210)",
+    }
+    for col, default_val in defaults.items():
+        if col not in df.columns:
+            df[col] = default_val
+        else:
+            df[col] = df[col].fillna(default_val)
+    return df
 
 
 def seed_state():
@@ -485,13 +532,30 @@ def seed_state():
         st.session_state.page = "Home"
 
     if "inventory" not in st.session_state:
-        st.session_state.inventory = initial_data.get("inventory", [])
+        st.session_state.inventory = [normalize_inventory_item(it) for it in initial_data.get("inventory", [])]
+    else:
+        # Guarantee every item currently in session state has full normalized keys
+        st.session_state.inventory = [normalize_inventory_item(it) for it in st.session_state.inventory]
 
     if "ngos" not in st.session_state:
         st.session_state.ngos = initial_data.get("ngos", [])
 
     if "tasks" not in st.session_state:
         st.session_state.tasks = initial_data.get("tasks", [])
+
+    if "kitchen_plan" not in st.session_state:
+        st.session_state.kitchen_plan = initial_data.get(
+            "kitchen_plan",
+            {
+                "day": "Monday",
+                "meal_type": "Lunch",
+                "plates": 400,
+                "prepared_kg": 180.0,
+                "predicted_surplus_plates": 44,
+                "predicted_surplus_kg": 19.8,
+                "waste_risk_kg": 19.8,
+            },
+        )
 
     if "analysis" not in st.session_state:
         st.session_state.analysis = {
@@ -898,7 +962,8 @@ def render_dashboard_page():
     st.markdown("<div style='margin-top:1.6rem;'></div>", unsafe_allow_html=True)
     st.subheader("Current Live Inventory Snapshot")
     if st.session_state.inventory:
-        inv_display = pd.DataFrame(st.session_state.inventory)[["item", "category", "quantity_kg", "expiry_hours", "status"]]
+        inv_df = safe_inventory_dataframe(st.session_state.inventory)
+        inv_display = inv_df[["item", "category", "quantity_kg", "expiry_hours", "status"]]
         inv_display.columns = ["Item Name", "Category", "Quantity (kg)", "Expiry Hours", "Status"]
         st.dataframe(inv_display, use_container_width=True, hide_index=True)
     else:
@@ -906,58 +971,230 @@ def render_dashboard_page():
 
 
 def render_inventory_page():
-    st.title("Food Inventory Management")
+    st.title("Food Inventory & Kitchen Operations")
+    st.markdown("<p style='color:#475569; margin-top:-0.5rem;'>Kitchen production planning, surplus broadcasting, and live inventory control.</p>", unsafe_allow_html=True)
 
-    with st.form("inventory_form"):
-        st.markdown("<h4 style='margin-top:0;'>Add New Food Batch</h4>", unsafe_allow_html=True)
-        c1, c2, c3, c4 = st.columns([1.5, 1, 1, 1.2])
-        with c1:
-            item_name = st.text_input("Item Name", placeholder="e.g. Cooked Basmati Rice, Fresh Greens")
-        with c2:
-            quantity = st.number_input("Quantity (kg)", min_value=0.5, value=12.0, step=1.0)
-        with c3:
-            expiry = st.number_input("Expiry (hours)", min_value=1, max_value=168, value=10)
-        with c4:
-            category = st.selectbox("Category", FOOD_CATEGORIES)
+    kitchen_tabs = st.tabs([
+        "🍳 Kitchen Production Terminal",
+        "📢 Post Surplus for NGOs",
+        "➕ Standard Item Entry",
+    ])
 
-        submitted = st.form_submit_button("➕ Add Item to Inventory", type="primary", use_container_width=True)
-        if submitted:
-            if item_name.strip():
-                new_item = {
-                    "id": f"item_{int(time.time() * 1000)}",
-                    "item": item_name.strip(),
-                    "quantity_kg": float(quantity),
-                    "expiry_hours": int(expiry),
-                    "status": compute_inventory_status(int(expiry)),
-                    "category": category,
+    # ---------------- TAB 1: KITCHEN PRODUCTION PLANNING ----------------
+    with kitchen_tabs[0]:
+        st.markdown("<div class='terminal-card'>", unsafe_allow_html=True)
+        st.markdown("<h4 style='margin-top:0;'>Daily Meal Volume & Waste Prediction Terminal</h4>", unsafe_allow_html=True)
+        st.write("Input planned kitchen volume to estimate expected consumption, surplus variance, and prevent waste before it happens.")
+
+        kp1, kp2, kp3 = st.columns([1.2, 1.2, 1.2])
+        with kp1:
+            plan_day = st.selectbox(
+                "Select Day of Week",
+                ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
+                index=["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"].index(
+                    st.session_state.kitchen_plan.get("day", "Monday")
+                ),
+                key="kp_day_select",
+            )
+        with kp2:
+            plan_meal = st.selectbox(
+                "Meal Type / Category",
+                ["Lunch", "Dinner", "Event catering", "Breakfast"],
+                index=["Lunch", "Dinner", "Event catering", "Breakfast"].index(
+                    st.session_state.kitchen_plan.get("meal_type", "Lunch")
+                ),
+                key="kp_meal_select",
+            )
+        with kp3:
+            plan_plates = st.number_input(
+                "Plates / Meals Prepared",
+                min_value=10,
+                max_value=10000,
+                value=int(st.session_state.kitchen_plan.get("plates", 400)),
+                step=25,
+                key="kp_plates_input",
+                help="Estimated number of meal portions prepared for this service.",
+            )
+
+        # Real-time waste prediction calculation
+        prediction = predict_kitchen_waste(plan_day, plan_meal, int(plan_plates))
+
+        st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total Food Volume", f"{prediction['total_prepared_kg']} kg", f"{plan_plates} plates")
+        m2.metric("Predicted Surplus", f"{prediction['predicted_surplus_plates']} plates", f"{prediction['predicted_surplus_kg']} kg")
+        m3.metric("Landfill Waste Risk", f"{prediction['predicted_surplus_kg']} kg", f"{prediction['surplus_rate_pct']}% rate")
+        m4.metric("CO2 Avoidable", f"{prediction['co2_avoidable_kg']} kg CO2", f"{prediction['water_avoidable_liters']} L water")
+
+        st.markdown(
+            f"""
+            <div style='background:#F0FDF4; border:1px solid rgba(16,185,129,0.3); border-radius:12px; padding:0.85rem 1.1rem; margin:1rem 0;'>
+                <strong style='color:#065F46;'>💡 Production Forecast Insight:</strong>
+                <span style='color:#047857;'>
+                    For <b>{plan_day} {plan_meal}</b>, model projects <b>~{prediction['safe_consumption_plates']} plates</b> consumed on-site.
+                    Pre-scheduling pickup for the anticipated <b>{prediction['predicted_surplus_plates']} surplus plates ({prediction['predicted_surplus_kg']} kg)</b> will eliminate waste.
+                </span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        col_save, _ = st.columns([1.5, 2])
+        with col_save:
+            if st.button("💾 Save Production Plan & Sync Forecast", type="primary", use_container_width=True, key="save_kp_btn"):
+                st.session_state.kitchen_plan = {
+                    "day": plan_day,
+                    "meal_type": plan_meal,
+                    "plates": int(plan_plates),
+                    "prepared_kg": prediction["total_prepared_kg"],
+                    "predicted_surplus_plates": prediction["predicted_surplus_plates"],
+                    "predicted_surplus_kg": prediction["predicted_surplus_kg"],
+                    "waste_risk_kg": prediction["predicted_surplus_kg"],
                 }
-                st.session_state.inventory.append(new_item)
-                save_current_data(inventory=st.session_state.inventory)
-                st.success(f"Added {item_name.strip()} ({quantity} kg) to inventory.")
+                save_current_data(kitchen_plan=st.session_state.kitchen_plan)
+                st.success(f"Saved {plan_day} {plan_meal} production forecast into operational plan!")
                 st.rerun()
-            else:
-                st.warning("Please provide a name for the food item.")
 
-    st.markdown("<div style='margin-top:1.8rem;'></div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # ---------------- TAB 2: NGO SURPLUS FOOD LOGGING ----------------
+    with kitchen_tabs[1]:
+        st.markdown("<div class='terminal-card'>", unsafe_allow_html=True)
+        st.markdown("<h4 style='margin-top:0;'>Post Excess Surplus Directly for NGO Pickup</h4>", unsafe_allow_html=True)
+        st.write("Post surplus batches directly to the live Redistribution Network so community shelters and food banks can claim and route pickups in real time.")
+
+        with st.form("ngo_surplus_upload_form"):
+            col_s1, col_s2 = st.columns([1.8, 1.2])
+            with col_s1:
+                surplus_name = st.text_input(
+                    "Food Name / Detailed Description",
+                    placeholder="e.g. Cooked Basmati Rice & Dal Makhani",
+                    help="Describe the food clearly for NGO meal planning.",
+                )
+            with col_s2:
+                surplus_cat = st.selectbox("Category", FOOD_CATEGORIES, index=0)
+
+            col_s3, col_s4, col_s5 = st.columns(3)
+            with col_s3:
+                surplus_kg = st.number_input("Quantity Available (kg)", min_value=1.0, value=25.0, step=1.0)
+            with col_s4:
+                surplus_window = st.selectbox(
+                    "Expiry / Freshness Window",
+                    ["Good for 2 hours", "Good for 4 hours", "Good for 6 hours", "Good for 12 hours", "Good for 24 hours"],
+                    index=2,
+                )
+            with col_s5:
+                surplus_condition = st.selectbox(
+                    "Storage / Transport Condition",
+                    ["Hot insulated (>65°C)", "Chilled cold chain (4°C)", "Packaged / Ready to Eat", "Ambient / Dry"],
+                    index=0,
+                )
+
+            col_s6, col_s7 = st.columns(2)
+            with col_s6:
+                surplus_loc = st.text_input(
+                    "Pickup Location / Loading Bay",
+                    value="Central Kitchen Hub, Bay 2",
+                    placeholder="e.g. Loading Dock Gate 3",
+                )
+            with col_s7:
+                surplus_contact = st.text_input(
+                    "Contact Person & Phone Number",
+                    value="Chef Marcus (+91 98765 43210)",
+                    placeholder="e.g. Kitchen Duty Manager (+91 ...)",
+                )
+
+            submitted_surplus = st.form_submit_button(
+                "🚀 Broadcast Surplus to NGO Network", type="primary", use_container_width=True
+            )
+            if submitted_surplus:
+                if surplus_name.strip():
+                    # Parse hours from window
+                    hours_val = 6
+                    try:
+                        hours_val = int(surplus_window.split()[2])
+                    except Exception:
+                        hours_val = 6
+
+                    new_surplus_item = {
+                        "id": f"surplus_{int(time.time() * 1000)}",
+                        "item": surplus_name.strip(),
+                        "category": surplus_cat,
+                        "quantity_kg": float(surplus_kg),
+                        "expiry_hours": hours_val,
+                        "status": compute_inventory_status(hours_val),
+                        "prepared_time": "Today, Just Cooked",
+                        "location": surplus_loc.strip() or "Central Kitchen Bay 1",
+                        "storage_condition": surplus_condition,
+                        "contact": surplus_contact.strip() or "Kitchen Duty Staff",
+                    }
+                    st.session_state.inventory.append(new_surplus_item)
+                    save_current_data(inventory=st.session_state.inventory)
+                    st.success(f"Surplus batch '{surplus_name.strip()}' ({surplus_kg} kg) broadcasted! Visible to all NGOs on Redistribution Network.")
+                    st.rerun()
+                else:
+                    st.warning("Please provide a name or description for the surplus food item.")
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # ---------------- TAB 3: STANDARD INVENTORY BATCH ENTRY ----------------
+    with kitchen_tabs[2]:
+        with st.form("inventory_form"):
+            st.markdown("<h4 style='margin-top:0;'>Add Standard Inventory Batch</h4>", unsafe_allow_html=True)
+            c1, c2, c3, c4 = st.columns([1.5, 1, 1, 1.2])
+            with c1:
+                item_name = st.text_input("Item Name", placeholder="e.g. Cooked Basmati Rice, Fresh Greens")
+            with c2:
+                quantity = st.number_input("Quantity (kg)", min_value=0.5, value=12.0, step=1.0)
+            with c3:
+                expiry = st.number_input("Expiry (hours)", min_value=1, max_value=168, value=10)
+            with c4:
+                category = st.selectbox("Category", FOOD_CATEGORIES, key="std_cat_select")
+
+            submitted = st.form_submit_button("➕ Add Item to Inventory", type="primary", use_container_width=True)
+            if submitted:
+                if item_name.strip():
+                    new_item = {
+                        "id": f"item_{int(time.time() * 1000)}",
+                        "item": item_name.strip(),
+                        "quantity_kg": float(quantity),
+                        "expiry_hours": int(expiry),
+                        "status": compute_inventory_status(int(expiry)),
+                        "category": category,
+                        "prepared_time": "Today, Recent Batch",
+                        "location": "Main Kitchen Hub",
+                        "storage_condition": "Standard Stored",
+                        "contact": "Kitchen Duty (+91 98765 43210)",
+                    }
+                    st.session_state.inventory.append(new_item)
+                    save_current_data(inventory=st.session_state.inventory)
+                    st.success(f"Added {item_name.strip()} ({quantity} kg) to inventory.")
+                    st.rerun()
+                else:
+                    st.warning("Please provide a name for the food item.")
+
+    st.markdown("<div style='margin-top:2rem;'></div>", unsafe_allow_html=True)
     head_c1, head_c2 = st.columns([3, 1])
     with head_c1:
         st.subheader("Live Inventory Tracker")
     with head_c2:
         if st.button("↺ Reset to Sample Inventory", key="reset_inv_btn", use_container_width=True):
             defaults = load_initial_data()
-            st.session_state.inventory = defaults.get("inventory", [])
+            st.session_state.inventory = [normalize_inventory_item(it) for it in defaults.get("inventory", [])]
             save_current_data(inventory=st.session_state.inventory)
             st.success("Reset inventory to initial demo items.")
             st.rerun()
 
     if st.session_state.inventory:
-        inv_df = pd.DataFrame(st.session_state.inventory)[["item", "category", "quantity_kg", "expiry_hours", "status"]]
-        inv_df.columns = ["Item Name", "Category", "Quantity (kg)", "Expiry Hours", "Status"]
-        st.dataframe(inv_df, use_container_width=True, hide_index=True)
+        inv_df = safe_inventory_dataframe(st.session_state.inventory)
+        display_cols = ["item", "category", "quantity_kg", "expiry_hours", "status", "prepared_time", "location"]
+        inv_display = inv_df[display_cols].copy()
+        inv_display.columns = ["Item Name", "Category", "Quantity (kg)", "Expiry (hrs)", "Status", "Prepared Time", "Pickup Location"]
+        st.dataframe(inv_display, use_container_width=True, hide_index=True)
     else:
-        st.info("The inventory is currently empty. Use the form above to add fresh or surplus items.")
+        st.info("The inventory is currently empty. Use the tabs above to log kitchen production or surplus food.")
 
-    st.markdown("<div style='margin-top:1.6rem;'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='margin-top:1.8rem;'></div>", unsafe_allow_html=True)
     st.markdown("<h4>Inventory Item Cards</h4>", unsafe_allow_html=True)
 
     if not st.session_state.inventory:
@@ -967,18 +1204,19 @@ def render_inventory_page():
         for idx, item in enumerate(st.session_state.inventory):
             with cards[idx % 3]:
                 st.markdown("<div class='card'>", unsafe_allow_html=True)
-                st.markdown(f"<strong style='font-size:1.1rem; color:#0F172A;'>{item['item']}</strong>", unsafe_allow_html=True)
-                st.markdown(f"<div style='color:#475569; margin:0.3rem 0;'>Category: <b>{item.get('category', 'Staples')}</b></div>", unsafe_allow_html=True)
-                st.markdown(f"<div style='color:#475569;'>Quantity: <b>{item['quantity_kg']} kg</b></div>", unsafe_allow_html=True)
-                st.markdown(f"<div style='color:#475569; margin-bottom:0.6rem;'>Expiry: <b>{item['expiry_hours']} hours</b></div>", unsafe_allow_html=True)
-                st.markdown(status_badge(item["status"]), unsafe_allow_html=True)
+                st.markdown(f"<strong style='font-size:1.1rem; color:#0F172A;'>{item.get('item', 'Food Item')}</strong>", unsafe_allow_html=True)
+                st.markdown(f"<div style='color:#475569; margin:0.3rem 0;'>Category: <b>{item.get('category', 'Prepared Food')}</b></div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='color:#475569;'>Quantity: <b>{item.get('quantity_kg', 0.0)} kg</b></div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='color:#475569;'>Expiry: <b>{item.get('expiry_hours', 0)} hours</b></div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='color:#475569; font-size:0.82rem;'>Location: {item.get('location', 'Main Hub')}</div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='margin:0.5rem 0;'>{status_badge(item.get('status', 'Good'))}</div>", unsafe_allow_html=True)
 
-                st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
+                st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
                 item_id = item.get("id", f"idx_{idx}")
                 if st.button("🗑️ Delete Item", key=f"del_item_{item_id}", use_container_width=True):
                     st.session_state.inventory = [it for it in st.session_state.inventory if it.get("id", f"idx_{idx}") != item_id]
                     save_current_data(inventory=st.session_state.inventory)
-                    st.success(f"Removed {item['item']}.")
+                    st.success(f"Removed {item.get('item', 'Item')}.")
                     st.rerun()
                 st.markdown("</div>", unsafe_allow_html=True)
                 st.markdown("<div style='height:10px;'></div>", unsafe_allow_html=True)
@@ -1050,6 +1288,10 @@ def render_quality_page():
                     "expiry_hours": 18 if result["status"] == "Good" else (6 if result["status"] == "Near Expiry" else 2),
                     "status": result["status"],
                     "category": inspected_cat,
+                    "prepared_time": "Today, Quality Verified",
+                    "location": "Quality Inspection Station",
+                    "storage_condition": "Inspected & Approved",
+                    "contact": "Quality Inspector",
                 }
                 st.session_state.inventory.append(new_entry)
                 save_current_data(inventory=st.session_state.inventory)
@@ -1062,14 +1304,57 @@ def render_quality_page():
 
 def render_redist_page():
     st.title("Redistribution Network & Logistics")
-    st.markdown("<p style='color:#475569; margin-top:-0.5rem;'>Match expiring kitchen surplus with nearby community hubs, shelters, and food banks.</p>", unsafe_allow_html=True)
+    st.markdown("<p style='color:#475569; margin-top:-0.5rem;'>Connect kitchen surplus directly with nearby community hubs, shelters, and food banks.</p>", unsafe_allow_html=True)
 
+    # ---------------- DEDICATED NGO SECTION: AVAILABLE SURPLUS TO CLAIM ----------------
+    st.markdown("<h3>📦 Available Surplus Batches for Immediate NGO Claim</h3>", unsafe_allow_html=True)
+    available_surplus = [it for it in st.session_state.inventory if it.get("status") in ["Good", "Near Expiry"]]
+
+    if not available_surplus:
+        st.info("No surplus food batches are currently pending claim. Kitchen staff can post batches in the Food Inventory tab.")
+    else:
+        surplus_cols = st.columns(3)
+        for idx, s_item in enumerate(available_surplus):
+            with surplus_cols[idx % 3]:
+                st.markdown("<div class='card'>", unsafe_allow_html=True)
+                st.markdown(f"<strong style='font-size:1.15rem; color:#0F172A;'>{s_item.get('item', 'Food Batch')}</strong>", unsafe_allow_html=True)
+                st.markdown(f"<div style='color:#10B981; font-weight:700; font-size:0.92rem; margin:0.2rem 0;'>{s_item.get('quantity_kg', 0.0)} kg &nbsp;·&nbsp; ~{int(s_item.get('quantity_kg', 0.0) * 2.2)} Portions</div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='color:#475569; font-size:0.86rem;'><b>Category:</b> {s_item.get('category', 'Prepared Food')}</div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='color:#475569; font-size:0.86rem;'><b>Freshness:</b> {s_item.get('expiry_hours', 6)} hrs remaining</div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='color:#475569; font-size:0.86rem;'><b>Condition:</b> {s_item.get('storage_condition', 'Chilled')}</div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='color:#475569; font-size:0.86rem;'><b>Location:</b> {s_item.get('location', 'Central Kitchen Hub')}</div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='color:#475569; font-size:0.86rem; margin-bottom:0.5rem;'><b>Contact:</b> {s_item.get('contact', 'Kitchen Staff')}</div>", unsafe_allow_html=True)
+                st.markdown(status_badge(s_item.get("status", "Good")), unsafe_allow_html=True)
+
+                st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
+                # NGO selection for claim
+                ngo_names = [n["name"] for n in st.session_state.ngos]
+                claimant_ngo_name = st.selectbox(
+                    "Claiming NGO Partner",
+                    ngo_names,
+                    key=f"select_ngo_for_{s_item['id']}",
+                )
+                claimant_ngo = next((n for n in st.session_state.ngos if n["name"] == claimant_ngo_name), st.session_state.ngos[0])
+
+                if st.button("⚡ Claim Surplus Batch", key=f"claim_batch_{s_item['id']}", type="primary", use_container_width=True):
+                    success, message = claim_specific_food_item(claimant_ngo, s_item["id"], st.session_state.inventory, st.session_state.tasks)
+                    if success:
+                        st.success(message)
+                    else:
+                        st.warning(message)
+                    st.rerun()
+
+                st.markdown("</div>", unsafe_allow_html=True)
+                st.markdown("<div style='height:10px;'></div>", unsafe_allow_html=True)
+
+    st.markdown("<div style='margin-top:2rem;'></div>", unsafe_allow_html=True)
+    st.subheader("Partner Organizations Overview")
     ngo_table = pd.DataFrame(st.session_state.ngos)[["name", "type", "distance_km", "capacity_kg", "status"]]
     ngo_table.columns = ["Partner Organization", "Type", "Distance (km)", "Capacity (kg)", "Current Status"]
     st.dataframe(ngo_table, use_container_width=True, hide_index=True)
 
     st.markdown("<div style='margin-top:1.5rem;'></div>", unsafe_allow_html=True)
-    st.subheader("Nearby Partner Dispatch Actions")
+    st.subheader("Partner Network Operations")
 
     ngo_cols = st.columns(4)
     for idx, ngo in enumerate(st.session_state.ngos):
@@ -1090,7 +1375,7 @@ def render_redist_page():
                         st.success(message)
                     st.rerun()
             else:
-                if st.button("🚚 Connect & Route", key=f"connect_{ngo['name']}", use_container_width=True):
+                if st.button("🚚 Auto Match & Route", key=f"connect_{ngo['name']}", use_container_width=True):
                     success, message = connect_partner(ngo, st.session_state.inventory, st.session_state.tasks)
                     if success:
                         st.success(message)
@@ -1098,7 +1383,7 @@ def render_redist_page():
                         st.warning(message)
                     st.rerun()
 
-                if st.button("📦 Claim Surplus", key=f"claim_{ngo['name']}", use_container_width=True):
+                if st.button("📦 Auto Claim Surplus", key=f"claim_{ngo['name']}", use_container_width=True):
                     success, message = claim_food_for_partner(ngo, st.session_state.inventory, st.session_state.tasks)
                     if success:
                         st.success(message)
@@ -1110,11 +1395,21 @@ def render_redist_page():
             st.markdown("<div style='height:10px;'></div>", unsafe_allow_html=True)
 
     st.markdown("<div style='margin-top:1.8rem;'></div>", unsafe_allow_html=True)
-    st.subheader("Live Route Tracking")
+    st.subheader("Live Route Tracking & Dispatches")
     if st.session_state.tasks:
-        tasks_df = pd.DataFrame(st.session_state.tasks)[["task", "recipient", "status", "eta"]]
-        tasks_df.columns = ["Task Description", "Recipient / Hub", "Status", "ETA / Duration"]
-        st.dataframe(tasks_df, use_container_width=True, hide_index=True)
+        tasks_df = pd.DataFrame(st.session_state.tasks)
+        col_subset = [c for c in ["task", "recipient", "status", "eta", "location", "contact"] if c in tasks_df.columns]
+        display_task_df = tasks_df[col_subset].copy()
+        col_rename = {
+            "task": "Task Description",
+            "recipient": "Recipient / Hub",
+            "status": "Status",
+            "eta": "ETA",
+            "location": "Pickup Bay",
+            "contact": "Contact Person",
+        }
+        display_task_df.rename(columns=col_rename, inplace=True)
+        st.dataframe(display_task_df, use_container_width=True, hide_index=True)
     else:
         st.info("No active dispatch routes.")
 
@@ -1194,9 +1489,9 @@ def render_analytics_page():
     st.markdown("<div style='margin-top:1.6rem;'></div>", unsafe_allow_html=True)
     st.subheader("Audited ESG Compliance Report")
 
-    total_kg = round(sum(float(item["quantity_kg"]) for item in st.session_state.inventory), 1)
+    total_kg = round(sum(float(item.get("quantity_kg", 0)) for item in st.session_state.inventory), 1)
     surplus_kg = round(
-        sum(float(item["quantity_kg"]) for item in st.session_state.inventory if item["status"] in ["Near Expiry", "Expired"]) * 0.7,
+        sum(float(item.get("quantity_kg", 0)) for item in st.session_state.inventory if item.get("status") in ["Near Expiry", "Expired"]) * 0.7,
         1,
     )
 

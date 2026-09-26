@@ -11,20 +11,38 @@
       "email": "manager@foodcycle.ai",
       "password": "pass123",
       "role": "Food Inspector"
+    },
+    "harshavictus7156@gmail.com": {
+      "name": "harsha",
+      "email": "harshavictus7156@gmail.com",
+      "password": "harshareddy*1",
+      "role": "Kitchen Staff"
     }
   },
   "inventory": [
     {
-      "id": "item_1",
-      "item": "Rice",
+      "id": "test_item_1",
+      "item": "Rice Batch",
+      "category": "Staples",
       "quantity_kg": 20.0,
-      "status": "Dispatched"
+      "expiry_hours": 6,
+      "status": "Dispatched",
+      "prepared_time": "Today, 11:30 AM",
+      "location": "Main Kitchen Central Station",
+      "storage_condition": "Chilled (4\u00b0C)",
+      "contact": "Kitchen Duty Manager (+91 98765 43210)"
     },
     {
-      "id": "item_2",
-      "item": "Salad",
+      "id": "test_item_2",
+      "item": "Salad Batch",
+      "category": "Vegetables",
       "quantity_kg": 10.0,
-      "status": "Dispatched"
+      "expiry_hours": 12,
+      "status": "Claimed",
+      "prepared_time": "Today, 11:30 AM",
+      "location": "Main Kitchen Central Station",
+      "storage_condition": "Chilled (4\u00b0C)",
+      "contact": "Kitchen Duty Manager (+91 98765 43210)"
     }
   ],
   "ngos": [
@@ -59,16 +77,29 @@
   ],
   "tasks": [
     {
-      "task": "Rice dispatch",
+      "task": "Rice Batch dispatch",
       "recipient": "Test NGO",
       "status": "Delivered",
-      "eta": "Done"
+      "eta": "Done",
+      "location": "Main Kitchen Central Station",
+      "contact": "Kitchen Duty Manager (+91 98765 43210)"
     },
     {
-      "task": "Salad claim allocation",
+      "task": "Salad Batch pickup (10.0 kg)",
       "recipient": "Test NGO",
       "status": "Claimed",
-      "eta": "10 min"
+      "eta": "10 min",
+      "location": "Main Kitchen Central Station",
+      "contact": "Kitchen Duty Manager (+91 98765 43210)"
     }
-  ]
+  ],
+  "kitchen_plan": {
+    "day": "Monday",
+    "meal_type": "Lunch",
+    "plates": 400,
+    "prepared_kg": 180.0,
+    "predicted_surplus_plates": 44,
+    "predicted_surplus_kg": 19.8,
+    "waste_risk_kg": 19.8
+  }
 }
