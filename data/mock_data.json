@@ -1,0 +1,74 @@
+{
+  "registered_users": {
+    "demo@foodcycle.ai": {
+      "name": "Demo User",
+      "email": "demo@foodcycle.ai",
+      "password": "demo123",
+      "role": "Kitchen Staff"
+    },
+    "manager@foodcycle.ai": {
+      "name": "Sarah Chen",
+      "email": "manager@foodcycle.ai",
+      "password": "pass123",
+      "role": "Food Inspector"
+    }
+  },
+  "inventory": [
+    {
+      "id": "item_1",
+      "item": "Rice",
+      "quantity_kg": 20.0,
+      "status": "Dispatched"
+    },
+    {
+      "id": "item_2",
+      "item": "Salad",
+      "quantity_kg": 10.0,
+      "status": "Dispatched"
+    }
+  ],
+  "ngos": [
+    {
+      "name": "Local NGOs Hub",
+      "distance_km": 4.2,
+      "capacity_kg": 100,
+      "type": "Community Hub",
+      "status": "Available"
+    },
+    {
+      "name": "City Food Bank",
+      "distance_km": 8.4,
+      "capacity_kg": 180,
+      "type": "Large Distribution",
+      "status": "Available"
+    },
+    {
+      "name": "Hope Shelter Network",
+      "distance_km": 6.1,
+      "capacity_kg": 130,
+      "type": "Support Network",
+      "status": "Available"
+    },
+    {
+      "name": "Community Care Kitchen",
+      "distance_km": 9.8,
+      "capacity_kg": 160,
+      "type": "Local Service",
+      "status": "Available"
+    }
+  ],
+  "tasks": [
+    {
+      "task": "Rice dispatch",
+      "recipient": "Test NGO",
+      "status": "Delivered",
+      "eta": "Done"
+    },
+    {
+      "task": "Salad claim allocation",
+      "recipient": "Test NGO",
+      "status": "Claimed",
+      "eta": "10 min"
+    }
+  ]
+}
